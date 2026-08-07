@@ -1,0 +1,28 @@
+# Git
+.git/
+.gitignore
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/
+
+# Tests
+tests/
+.pytest_cache/
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Données intermédiaires
+data/processed/
+
+# Documentation / images
+formule.png
