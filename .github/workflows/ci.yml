@@ -9,11 +9,18 @@ on:
     branches:
       - main
 
+
 jobs:
+
+  # ==========================================================
+  # 1. TESTS PYTHON
+  # ==========================================================
+
   test:
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Recuperer le projet
         uses: actions/checkout@v4
 
@@ -31,8 +38,18 @@ jobs:
         run: |
           pytest -v
 
+
+  # ==========================================================
+  # 2. BUILD DOCKER + PUSH ECR
+  # ==========================================================
+
   docker:
     needs: test
+
+    # Le deploiement AWS ne se fait que lors d'un push sur main.
+    # Une Pull Request execute seulement les tests.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
     runs-on: ubuntu-latest
 
     permissions:
@@ -44,26 +61,214 @@ jobs:
       ECR_REPOSITORY: titanic-dev-api
 
     steps:
+
       - name: Recuperer le projet
         uses: actions/checkout@v4
 
       - name: Configurer les credentials AWS via OIDC
-        uses: aws-actions/configure-aws-credentials@v6
+        uses: aws-actions/configure-aws-credentials@v6.2.3
         with:
           role-to-assume: arn:aws:iam::435466090607:role/GitHubActionsTitanicRole
           aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: "435466090607"
 
       - name: Connexion a Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Construire et pousser l'image Docker vers ECR
+      - name: Construire et pousser image Docker vers ECR
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
+          echo "Construction de l'image :"
+          echo "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
           docker buildx build \
             --platform linux/amd64 \
             --provenance=false \
             --output type=image,name=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG,push=true,oci-mediatypes=false \
             .
+
+
+  # ==========================================================
+  # 3. DEPLOIEMENT SAGEMAKER
+  # ==========================================================
+
+  deploy:
+    needs: docker
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+
+      AWS_REGION: eu-west-3
+
+      ECR_REPOSITORY: titanic-dev-api
+
+      ENDPOINT_NAME: titanic-dev-endpoint
+
+      SAGEMAKER_ROLE_ARN: arn:aws:iam::435466090607:role/TitanicSageMakerExecutionRole
+
+      INSTANCE_TYPE: ml.t2.medium
+
+    steps:
+
+      - name: Recuperer le projet
+        uses: actions/checkout@v4
+
+
+      # ------------------------------------------------------
+      # Authentification AWS
+      # ------------------------------------------------------
+
+      - name: Configurer AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::435466090607:role/GitHubActionsTitanicRole
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: "435466090607"
+
+
+      # ------------------------------------------------------
+      # Recuperer URI ECR
+      # ------------------------------------------------------
+
+      - name: Connexion a Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+
+      # ------------------------------------------------------
+      # Generer les noms du modele et de la configuration
+      # ------------------------------------------------------
+
+      - name: Definir les variables du deploiement
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          MODEL_NAME="titanic-dev-model-${SHORT_SHA}-${GITHUB_RUN_ATTEMPT}"
+
+          CONFIG_NAME="titanic-dev-config-${SHORT_SHA}-${GITHUB_RUN_ATTEMPT}"
+
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+
+          echo "MODEL_NAME=$MODEL_NAME" >> "$GITHUB_ENV"
+
+          echo "CONFIG_NAME=$CONFIG_NAME" >> "$GITHUB_ENV"
+
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+
+          echo "--------------------------------------"
+          echo "Modele       : $MODEL_NAME"
+          echo "Configuration: $CONFIG_NAME"
+          echo "Image ECR    : $IMAGE_URI"
+          echo "Endpoint     : $ENDPOINT_NAME"
+          echo "--------------------------------------"
+
+
+      # ------------------------------------------------------
+      # Creer le modele SageMaker
+      # ------------------------------------------------------
+
+      - name: Creer le modele SageMaker
+        run: |
+
+          aws sagemaker create-model \
+            --model-name "$MODEL_NAME" \
+            --primary-container Image="$IMAGE_URI" \
+            --execution-role-arn "$SAGEMAKER_ROLE_ARN" \
+            --region "$AWS_REGION"
+
+
+      # ------------------------------------------------------
+      # Creer EndpointConfig
+      # ------------------------------------------------------
+
+      - name: Creer EndpointConfig
+        run: |
+
+          aws sagemaker create-endpoint-config \
+            --endpoint-config-name "$CONFIG_NAME" \
+            --production-variants \
+              VariantName=AllTraffic,ModelName="$MODEL_NAME",InitialInstanceCount=1,InstanceType="$INSTANCE_TYPE" \
+            --region "$AWS_REGION"
+
+
+      # ------------------------------------------------------
+      # Creer OU mettre a jour endpoint
+      # ------------------------------------------------------
+
+      - name: Creer ou mettre a jour endpoint SageMaker
+        run: |
+
+          echo "Verification de l'existence de l'endpoint..."
+
+          if aws sagemaker describe-endpoint \
+            --endpoint-name "$ENDPOINT_NAME" \
+            --region "$AWS_REGION" \
+            > /dev/null 2>&1
+          then
+
+            echo "Endpoint existant."
+            echo "Mise a jour vers la nouvelle configuration..."
+
+            aws sagemaker update-endpoint \
+              --endpoint-name "$ENDPOINT_NAME" \
+              --endpoint-config-name "$CONFIG_NAME" \
+              --region "$AWS_REGION"
+
+          else
+
+            echo "Endpoint inexistant."
+            echo "Creation du premier endpoint..."
+
+            aws sagemaker create-endpoint \
+              --endpoint-name "$ENDPOINT_NAME" \
+              --endpoint-config-name "$CONFIG_NAME" \
+              --region "$AWS_REGION"
+
+          fi
+
+
+      # ------------------------------------------------------
+      # Attendre que endpoint soit disponible
+      # ------------------------------------------------------
+
+      - name: Attendre endpoint InService
+        run: |
+
+          echo "Attente du deploiement SageMaker..."
+
+          aws sagemaker wait endpoint-in-service \
+            --endpoint-name "$ENDPOINT_NAME" \
+            --region "$AWS_REGION"
+
+          echo "Endpoint SageMaker InService."
+
+
+      # ------------------------------------------------------
+      # Afficher resultat final
+      # ------------------------------------------------------
+
+      - name: Verifier endpoint deploye
+        run: |
+
+          aws sagemaker describe-endpoint \
+            --endpoint-name "$ENDPOINT_NAME" \
+            --region "$AWS_REGION" \
+            --query '{
+              Endpoint:EndpointName,
+              Status:EndpointStatus,
+              Configuration:EndpointConfigName
+            }' \
+            --output table
